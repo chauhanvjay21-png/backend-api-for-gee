@@ -11,6 +11,57 @@ Environment variables expected:
 - API_KEY            : a random string the frontend will send in x-api-key
 - ALLOWED_ORIGINS    : CORS origin(s) (default '*')
 """
+# safe_key_loader.py (insert at top of server.py, before EE_KEY_FILE usage)
+import os, tempfile, base64, json
+
+def write_key_file_from_env():
+    # If EE_KEY_FILE already set, do nothing
+    if os.environ.get('EE_KEY_FILE'):
+        return os.environ.get('EE_KEY_FILE')
+
+    # EE_KEY_JSON: raw JSON as string (multiline)
+    ee_json = os.environ.get('EE_KEY_JSON')
+    if ee_json:
+        # If the UI inserted literal '\n' characters (i.e. backslash-n) try unescaping first
+        if "\\n" in ee_json and not ee_json.strip().startswith("{"):
+            try:
+                unescaped = ee_json.encode('utf-8').decode('unicode_escape')
+                # quick validation
+                json.loads(unescaped)
+                ee_json = unescaped
+            except Exception:
+                # leave ee_json as-is; try to parse below and fail if invalid
+                pass
+        # write to temp file
+        tf = tempfile.NamedTemporaryFile('w', delete=False, suffix='.json')
+        tf.write(ee_json)
+        tf.flush(); tf.close()
+        try: os.chmod(tf.name, 0o600)
+        except Exception: pass
+        os.environ['EE_KEY_FILE'] = tf.name
+        return tf.name
+
+    # EE_KEY_JSON_B64: base64 encoded JSON
+    ee_json_b64 = os.environ.get('EE_KEY_JSON_B64')
+    if ee_json_b64:
+        try:
+            data = base64.b64decode(ee_json_b64)
+            # validate
+            json.loads(data)
+            tf = tempfile.NamedTemporaryFile('wb', delete=False, suffix='.json')
+            tf.write(data)
+            tf.flush(); tf.close()
+            try: os.chmod(tf.name, 0o600)
+            except Exception: pass
+            os.environ['EE_KEY_FILE'] = tf.name
+            return tf.name
+        except Exception as ex:
+            raise RuntimeError('Invalid EE_KEY_JSON_B64: ' + str(ex))
+
+    return None
+
+# call loader early
+write_key_file_from_env()
 import os
 import time
 import tempfile
