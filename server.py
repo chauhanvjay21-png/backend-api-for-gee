@@ -1,35 +1,85 @@
-# server.py
+#!/usr/bin/env python3
+"""
+server.py
+Flask backend for Earth Engine map tiles and timeseries.
+
+Environment variables expected:
+- EE_SERVICE_ACCOUNT : service account email (from client_email in JSON)
+- EE_KEY_FILE        : path to JSON key file (optional if EE_KEY_JSON used)
+- EE_KEY_JSON        : (optional) full JSON content of key; server will write to temp file
+- EE_PROJECT         : GCP project id (from project_id in JSON)
+- API_KEY            : a random string the frontend will send in x-api-key
+- ALLOWED_ORIGINS    : CORS origin(s) (default '*')
+"""
 import os
 import time
+import tempfile
 from datetime import datetime, timedelta
+from functools import wraps
+
 from flask import Flask, request, jsonify, abort
-from functools import lru_cache
 import ee
 
-# --------- Configuration (set these as environment variables) ----------
-EE_SERVICE_ACCOUNT = os.environ.get('EE_SERVICE_ACCOUNT')  # e.g. river-auth-gee@...iam.gserviceaccount.com
-EE_KEY_FILE = os.environ.get('EE_KEY_FILE')                # path inside container to JSON key
-EE_PROJECT = os.environ.get('EE_PROJECT')                  # GCP project id
-API_KEY = os.environ.get('API_KEY')                        # simple API key to protect endpoints
-ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*')   # configure properly in prod
-# ---------------------------------------------------------------------
+# ------------------- handle EE_KEY_JSON -> write file if provided -------------------
+# If EE_KEY_JSON is provided (e.g., via Secret Manager), write it to a temp file and set EE_KEY_FILE.
+if not os.environ.get('EE_KEY_FILE') and os.environ.get('EE_KEY_JSON'):
+    tmpf = tempfile.NamedTemporaryFile('w', delete=False, suffix='.json')
+    tmpf.write(os.environ.get('EE_KEY_JSON'))
+    tmpf.flush()
+    tmpf.close()
+    os.environ['EE_KEY_FILE'] = tmpf.name
+    try:
+        os.chmod(tmpf.name, 0o600)
+    except Exception:
+        pass
+# ------------------------------------------------------------------------------
+
+EE_SERVICE_ACCOUNT = os.environ.get('EE_SERVICE_ACCOUNT')
+EE_KEY_FILE = os.environ.get('EE_KEY_FILE')
+EE_PROJECT = os.environ.get('EE_PROJECT')
+API_KEY = os.environ.get('API_KEY')
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*')
 
 if not EE_SERVICE_ACCOUNT or not EE_KEY_FILE:
-    raise RuntimeError('Set EE_SERVICE_ACCOUNT and EE_KEY_FILE environment variables')
+    raise RuntimeError('EE_SERVICE_ACCOUNT and EE_KEY_FILE (or EE_KEY_JSON) must be set as environment variables.')
 
-# Initialize Earth Engine using service account
-credentials = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, EE_KEY_FILE)
-ee.Initialize(credentials, project=EE_PROJECT)
+# Initialize Earth Engine
+try:
+    credentials = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, EE_KEY_FILE)
+    ee.Initialize(credentials, project=EE_PROJECT)
+except Exception as ex:
+    raise RuntimeError('Failed to initialize Earth Engine: ' + str(ex))
 
 app = Flask(__name__)
 
-# Simple API-key check (for demo). Replace / improve with real auth in production.
-def require_api_key():
-    key = request.headers.get('x-api-key') or request.args.get('api_key')
-    if API_KEY and key != API_KEY:
-        abort(401)
+# small in-memory cache for map tokens
+CACHE = {}
 
-# Minimal CORS (for demo)
+def cache_get(key):
+    e = CACHE.get(key)
+    if not e:
+        return None
+    # TTL 2 hours
+    if time.time() - e['created_at'] > 7200:
+        CACHE.pop(key, None)
+        return None
+    return e
+
+def cache_set(key, value):
+    value['created_at'] = time.time()
+    CACHE[key] = value
+
+# simple API key decorator
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        key = request.headers.get('x-api-key') or request.args.get('api_key')
+        if API_KEY and key != API_KEY:
+            return jsonify({'error': 'unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+# minimal CORS
 @app.after_request
 def add_cors(resp):
     resp.headers['Access-Control-Allow-Origin'] = ALLOWED_ORIGINS
@@ -37,7 +87,7 @@ def add_cors(resp):
     resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return resp
 
-# Build index image and visualization
+# Build visualization image based on index
 def build_visual_image(start_date, end_date, index='NDVI'):
     col = (ee.ImageCollection('COPERNICUS/S2_SR')
            .filterDate(start_date, end_date)
@@ -52,34 +102,19 @@ def build_visual_image(start_date, end_date, index='NDVI'):
         vis = {'min': -0.5, 'max': 0.8, 'palette': ['#ffffff','#a6cee3','#1f78b4','#08519c']}
         return nd, vis
     else:
-        rgb = img.visualize(bands=['B4','B3','B2'], min=0, max=3000)
-        # For getMapId, ensure the image is an ee.Image
-        return ee.Image(rgb), {'min':0, 'max':3000}
-
-# Simple in-memory cache for mapid results keyed by (start,end,index)
-# Value: {mapid, token, created_at}
-CACHE = {}
-
-def cache_get(key):
-    entry = CACHE.get(key)
-    if not entry: return None
-    # token validity: map tokens generally valid for a few hours. Refresh after 2 hours.
-    if time.time() - entry['created_at'] > 7200:
-        del CACHE[key]
-        return None
-    return entry
-
-def cache_set(key, value):
-    CACHE[key] = value
+        # RGB visualize (convert to 8-bit visualization)
+        vis = {'bands': ['B4','B3','B2'], 'min': 0, 'max': 3000}
+        rgb = img.visualize(**vis)
+        return ee.Image(rgb), {'min':0,'max':3000}
 
 @app.route('/gee/map')
+@require_api_key
 def gee_map():
-    require_api_key()
     start = request.args.get('start')
     end = request.args.get('end')
     index = request.args.get('index', 'NDVI')
 
-    # sanity defaults
+    # defaults if missing: last 14 days
     if not start or not end:
         end_dt = datetime.utcnow().date()
         start_dt = end_dt - timedelta(days=14)
@@ -93,19 +128,18 @@ def gee_map():
 
     try:
         img, vis = build_visual_image(start, end, index=index)
-        # getMapId (note: ee.Image.getMapId expects visualization dict for non-visualized images)
         mapid_dict = ee.Image(img).getMapId(vis)
-        mapid = mapid_dict['mapid']
+        mapid = mapid_dict.get('mapid')
         token = mapid_dict.get('token')
         tile_url = f"https://earthengine.googleapis.com/map/{mapid}/{{z}}/{{x}}/{{y}}?token={token}"
-        cache_set(key, {'mapid': mapid, 'token': token, 'tileUrl': tile_url, 'created_at': time.time()})
+        cache_set(key, {'mapid': mapid, 'token': token, 'tileUrl': tile_url})
         return jsonify({'tileUrlTemplate': tile_url, 'mapid': mapid, 'cached': False})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/gee/timeseries')
+@require_api_key
 def gee_timeseries():
-    require_api_key()
     try:
         lat = float(request.args.get('lat'))
         lon = float(request.args.get('lon'))
@@ -123,7 +157,6 @@ def gee_timeseries():
         end_date = ee.Date(end)
         point = ee.Geometry.Point(lon, lat)
 
-        # compute monthly steps
         months = ee.List.sequence(0, end_date.difference(start_date, 'month').toInt())
         def month_map(n):
             n = ee.Number(n)
@@ -134,14 +167,11 @@ def gee_timeseries():
                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60)))
             img = col.median()
             if index.upper() == 'NDVI':
-                idx = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
-                band = 'NDVI'
+                idx = img.normalizedDifference(['B8', 'B4']).rename('NDVI'); band = 'NDVI'
             elif index.upper() == 'NDWI':
-                idx = img.normalizedDifference(['B3', 'B8']).rename('NDWI')
-                band = 'NDWI'
+                idx = img.normalizedDifference(['B3', 'B8']).rename('NDWI'); band = 'NDWI'
             else:
-                idx = img.select('B4').rename('B4')
-                band = 'B4'
+                idx = img.select('B4').rename('B4'); band = 'B4'
             meanVal = idx.reduceRegion(ee.Reducer.mean(), point, 30).get(band)
             return ee.Feature(None, {'date': s.format('YYYY-MM-dd'), 'value': meanVal})
 
